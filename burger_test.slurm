@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=burger_test
-#SBATCH --partition=gpu_mi300
-#SBATCH --gres=gpu:1
-#SBATCH --time=48:00:00
-#SBATCH --output=ChangeFormer_%j.out
-#SBATCH --error=ChangeFormer_%j.err
+#SBATCH --job-name = burger_test
+#SBATCH --partition = gpu_mi300
+#SBATCH --gres = gpu:1
+#SBATCH --time = 48:00:00
+#SBATCH --output = CD_DRL_%j.out
+#SBATCH --error = CD_DRL_%j.err
 
 cd "$SLURM_SUBMIT_DIR"
 
@@ -41,9 +41,9 @@ EOF
 
 jupyter nbconvert \
     --to notebook \
-    --execute Untitled.ipynb \
+    --execute Train_Model.ipynb \
     --ExecutePreprocessor.kernel_name=burger_rocm \
     --ExecutePreprocessor.timeout=-1 \
-    --output Untitled_executed.ipynb
+    --output Train_Model_executed.ipynb
 
 echo "Notebook execution completed."
