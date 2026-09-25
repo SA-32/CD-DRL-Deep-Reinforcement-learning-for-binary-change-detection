@@ -1,227 +1,276 @@
-import torch
 import torch.nn as nn
+import torch
+from efficientnet_pytorch import EfficientNet
 import torch.nn.functional as F
 
 
-def c(ch: int, scale: float) -> int:
 
-    return max(8, int(round(ch * scale)))
-
-
-def conv_bn_relu(in_ch, out_ch, kernel_size=3, dilation=1, stride=1):
-    
-    padding = dilation * (kernel_size - 1) // 2
-    return nn.Sequential(
-        nn.Conv2d(in_ch, out_ch, kernel_size, stride=stride,
-                  padding=padding, dilation=dilation, bias=False),
-        nn.BatchNorm2d(out_ch),
-        nn.ReLU(inplace=True),
-    )
-
-
-# --------------------------------------------------------------------------- #
-#  Feature extraction module: VGG16 with half channels + dilated convolutions
-# --------------------------------------------------------------------------- #
-
-class VGG16HalfEncoder(nn.Module):
-    
-    def __init__(self, in_channels: int = 1, scale: float = 0.5, dilation: int = 1):
-        super().__init__()
-        c1, c2, c3, c4 = c(64, scale), c(128, scale), c(256, scale), c(512, scale)
-
-        # Block 1 (full resolution) -> conv1-2 is the first skip connection
-        self.block1 = nn.Sequential(
-            conv_bn_relu(in_channels, c1, dilation=dilation),
-            conv_bn_relu(c1, c1, dilation=dilation),
-        )
-        self.pool1 = nn.MaxPool2d(2, 2)  # -> 1/2
-
-        # Block 2 (1/2 resolution) -> conv2-2 is the second skip connection
-        self.block2 = nn.Sequential(
-            conv_bn_relu(c1, c2, dilation=dilation),
-            conv_bn_relu(c2, c2, dilation=dilation),
-        )
-        self.pool2 = nn.MaxPool2d(2, 2)  # -> 1/4
-
-        # Block 3 (1/4 resolution) -> conv3-3 is the third skip connection
-        self.block3 = nn.Sequential(
-            conv_bn_relu(c2, c3, dilation=dilation),
-            conv_bn_relu(c3, c3, dilation=dilation),
-            conv_bn_relu(c3, c3, dilation=dilation),
-        )
-        self.pool3 = nn.MaxPool2d(2, 2)  # -> 1/8
-
-        # Block 4 (1/8 resolution) -> conv4-3, deepest feature fed to SAM
-        self.block4 = nn.Sequential(
-            conv_bn_relu(c3, c4, dilation=dilation),
-            conv_bn_relu(c4, c4, dilation=dilation),
-            conv_bn_relu(c4, c4, dilation=dilation),
-        )
-        self.pool4 = nn.MaxPool2d(2, 2)  # -> 1/16
-
-        self.out_channels = dict(c1=c1, c2=c2, c3=c3, c4=c4)
+#-----EffinientNet Components-----#
+class EfficientNet_Encoder(nn.Module):
+    def __init__(self, efn, start, end):
+        super(EfficientNet_Encoder, self).__init__()
+        self.blocks = efn._blocks[start:end]
 
     def forward(self, x):
-        f1 = self.block1(x)        # conv1-2, full res      -> skip
-        p1 = self.pool1(f1)
-        f2 = self.block2(p1)       # conv2-2, 1/2 res        -> skip
-        p2 = self.pool2(f2)
-        f3 = self.block3(p2)       # conv3-3, 1/4 res        -> skip
-        p3 = self.pool3(f3)
-        f4 = self.block4(p3)       # conv4-3, 1/8 res        -> fed to SAM
-        p4 = self.pool4(f4)
-        return p1, p2, p3, p4
+        for idx, block in enumerate(self.blocks):
+            x = block(x)
+        return x
 
+class AC_CoDE(nn.Module):
+    def __init__(self, encoder='efficientnet-b0', pretrained=True):
+        super(AC_CoDE, self).__init__()
+        #_/_/_/ Feature Extractor _/_/_/
+        if pretrained:
+            efn = EfficientNet.from_pretrained(encoder)
+        else:
+            efn = EfficientNet.from_name(encoder)
 
-# --------------------------------------------------------------------------- #
-#  Self-Attention Module (SAM) -- non-local self-attention, Eq. (1) + Fig. 1
-# --------------------------------------------------------------------------- #
+        efn_params = {
+            'efficientnet-b0': {'filters': [32, 24, 40, 80, 192], 'ends': [3, 5, 8, 15]},
+            'efficientnet-b1': {'filters': [32, 24, 40, 80, 192], 'ends': [5, 8, 12, 21]},
+            'efficientnet-b2': {'filters': [32, 24, 48, 88, 208], 'ends': [5, 8, 12, 21]},
+            'efficientnet-b3': {'filters': [40, 32, 48, 96, 232], 'ends': [5, 8, 13, 24]},
+            'efficientnet-b4': {'filters': [48, 32, 56, 112, 272], 'ends': [6, 10, 16, 30]},
+            'efficientnet-b5': {'filters': [48, 40, 64, 128, 304], 'ends': [8, 13, 20, 36]},
+            'efficientnet-b6': {'filters': [56, 40, 72, 144, 344], 'ends': [9, 15, 23, 42]},
+            'efficientnet-b7': {'filters': [64, 48, 80, 160, 384], 'ends': [11, 18, 28, 51]},
+        }
 
-class SelfAttentionModule(nn.Module):
+        # feature extractor
+        self.conv_stem = nn.Sequential(
+            efn._conv_stem,
+            nn.BatchNorm2d(efn_params[encoder]['filters'][0]),
+        )
 
-    def __init__(self, channels: int, reduction: int = 2):
-        super().__init__()
-        inter = max(1, channels // reduction)
-        self.query = nn.Conv2d(channels, inter, kernel_size=1)
-        self.key = nn.Conv2d(channels, inter, kernel_size=1)
-        self.value = nn.Conv2d(channels, channels, kernel_size=1)
-        self.out_proj = nn.Conv2d(channels, channels, kernel_size=1)
-        self.softmax = nn.Softmax(dim=-1)
+        self.down1 = EfficientNet_Encoder(efn, start=0,
+                                          end=efn_params[encoder]['ends'][0])
+        self.down2 = EfficientNet_Encoder(efn, start=efn_params[encoder]['ends'][0],
+                                          end=efn_params[encoder]['ends'][1])
+        self.down3 = EfficientNet_Encoder(efn, start=efn_params[encoder]['ends'][1],
+                                          end=efn_params[encoder]['ends'][2])
+        self.down4 = EfficientNet_Encoder(efn, start=efn_params[encoder]['ends'][2],
+                                          end=efn_params[encoder]['ends'][3])
 
-    def forward(self, f_att):
-        b, ch, h, w = f_att.shape
-        q = self.query(f_att).view(b, -1, h * w).permute(0, 2, 1)      # (B, HW, C/2)
-        k = self.key(f_att).view(b, -1, h * w)                          # (B, C/2, HW)
-        v = self.value(f_att).view(b, ch, h * w).permute(0, 2, 1)       # (B, HW, C)
+        # policy network
+        self.p_up1 = nn.Sequential(
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(efn_params[encoder]['filters'][4], efn_params[encoder]['filters'][3], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][3]),
+            nn.ReLU(inplace=True),
+        )
+        self.p_merge1 = nn.Sequential(
+            nn.Conv2d(efn_params[encoder]['filters'][3]*2, efn_params[encoder]['filters'][3], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][3]),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(efn_params[encoder]['filters'][3], efn_params[encoder]['filters'][3], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][3]),
+            nn.ReLU(inplace=True),
+        )
 
-        attn = self.softmax(torch.bmm(q, k))                            # (B, HW, HW)
-        out = torch.bmm(attn, v)                                        # (B, HW, C)
-        out = out.permute(0, 2, 1).contiguous().view(b, ch, h, w)
-        out = self.out_proj(out)
-        return out + f_att   # residual connection ("+ f_att" in Eq. 1 / Fig. 1)
+        self.p_up2 = nn.Sequential(
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(efn_params[encoder]['filters'][3], efn_params[encoder]['filters'][2], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][2]),
+            nn.ReLU(inplace=True),
+        )
+        self.p_merge2 = nn.Sequential(
+            nn.Conv2d(efn_params[encoder]['filters'][2] * 2, efn_params[encoder]['filters'][2], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][2]),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(efn_params[encoder]['filters'][2], efn_params[encoder]['filters'][2], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][2]),
+            nn.ReLU(inplace=True),
+        )
 
+        self.p_up3 = nn.Sequential(
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(efn_params[encoder]['filters'][2], efn_params[encoder]['filters'][1], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][1]),
+            nn.ReLU(inplace=True),
+        )
+        self.p_merge3 = nn.Sequential(
+            nn.Conv2d(efn_params[encoder]['filters'][1] * 2, efn_params[encoder]['filters'][1], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][1]),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(efn_params[encoder]['filters'][1], efn_params[encoder]['filters'][1], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][1]),
+            nn.ReLU(inplace=True),
+        )
 
-# --------------------------------------------------------------------------- #
-#  Shared trunk: encoder + SAM  (parameters theta_s)
-# --------------------------------------------------------------------------- #
+        self.p_up4 = nn.Sequential(
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(efn_params[encoder]['filters'][1], efn_params[encoder]['filters'][0], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][0]),
+            nn.ReLU(inplace=True),
+        )
+        self.p_merge4 = nn.Sequential(
+            nn.Conv2d(efn_params[encoder]['filters'][0] * 2, efn_params[encoder]['filters'][0], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][0]),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(efn_params[encoder]['filters'][0], efn_params[encoder]['filters'][0], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][0]),
+            nn.ReLU(inplace=True),
+        )
 
-class SharedTrunk(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.encoder = VGG16HalfEncoder(in_channels = 1, scale = 0.5, dilation = 2)
-        self.sam = SelfAttentionModule(256, reduction = 2)
-        self.out_channels = self.encoder.out_channels
+        # policy mask conv
+        self.p_mask_out = nn.Sequential(
+            nn.Conv2d(1, efn_params[encoder]['filters'][0], 1, bias=False),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][0]),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(efn_params[encoder]['filters'][0], efn_params[encoder]['filters'][0], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][0]),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(efn_params[encoder]['filters'][0], efn_params[encoder]['filters'][0], 3, 2, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][0]),
+            nn.ReLU(inplace=True),
+        )
 
-    def forward(self, x):
-        f1, f2, f3, f4 = self.encoder(x)
-        s = self.sam(f4)          # s^(t): global-information-enriched bottleneck feature
-        return f1, f2, f3, s
+        self.p_head = nn.Sequential(
+            nn.Conv2d(efn_params[encoder]['filters'][0] * 3, efn_params[encoder]['filters'][0], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][0]),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(efn_params[encoder]['filters'][0], efn_params[encoder]['filters'][0], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][0]),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(efn_params[encoder]['filters'][0], 2, 3, 1, 1)
+        )
+        
 
+        # value network
+        self.v_up1 = nn.Sequential(
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(efn_params[encoder]['filters'][4], efn_params[encoder]['filters'][3], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][3]),
+            nn.ReLU(inplace=True),
+        )
+        self.v_merge1 = nn.Sequential(
+            nn.Conv2d(efn_params[encoder]['filters'][3] * 2, efn_params[encoder]['filters'][3], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][3]),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(efn_params[encoder]['filters'][3], efn_params[encoder]['filters'][3], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][3]),
+            nn.ReLU(inplace=True),
+        )
 
-# --------------------------------------------------------------------------- #
-#  Decoder head shared structure: dilated-conv upsampling decoder with skips
-# --------------------------------------------------------------------------- #
+        self.v_up2 = nn.Sequential(
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(efn_params[encoder]['filters'][3], efn_params[encoder]['filters'][2], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][2]),
+            nn.ReLU(inplace=True),
+        )
+        self.v_merge2 = nn.Sequential(
+            nn.Conv2d(efn_params[encoder]['filters'][2] * 2, efn_params[encoder]['filters'][2], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][2]),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(efn_params[encoder]['filters'][2], efn_params[encoder]['filters'][2], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][2]),
+            nn.ReLU(inplace=True),
+        )
 
-class DilatedDecoderHead(nn.Module):
-    
-    def __init__(self, enc_channels: dict, out_channels: int, dilation: int = 2):
-        super().__init__()
-        c1, c2, c3, c4 = (enc_channels["c1"], enc_channels["c2"],
-                          enc_channels["c3"], enc_channels["c4"])
+        self.v_up3 = nn.Sequential(
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(efn_params[encoder]['filters'][2], efn_params[encoder]['filters'][1], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][1]),
+            nn.ReLU(inplace=True),
+        )
+        self.v_merge3 = nn.Sequential(
+            nn.Conv2d(efn_params[encoder]['filters'][1] * 2, efn_params[encoder]['filters'][1], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][1]),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(efn_params[encoder]['filters'][1], efn_params[encoder]['filters'][1], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][1]),
+            nn.ReLU(inplace=True),
+        )
 
-        self.up4to3 = conv_bn_relu(c4, c3, dilation=dilation)
-        self.dec3   = conv_bn_relu(c3 + c3, c3, dilation=dilation)
+        self.v_up4 = nn.Sequential(
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(efn_params[encoder]['filters'][1], efn_params[encoder]['filters'][0], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][0]),
+            nn.ReLU(inplace=True),
+        )
+        self.v_merge4 = nn.Sequential(
+            nn.Conv2d(efn_params[encoder]['filters'][0] * 2, efn_params[encoder]['filters'][0], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][0]),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(efn_params[encoder]['filters'][0], efn_params[encoder]['filters'][0], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][0]),
+            nn.ReLU(inplace=True),
+        )
 
-        self.up3to2 = conv_bn_relu(c3, c2, dilation=dilation)
-        self.dec2   = conv_bn_relu(c2 + c2, c2, dilation=dilation)
+        # policy mask conv
+        self.v_mask_out = nn.Sequential(
+            nn.Conv2d(1, efn_params[encoder]['filters'][0], 1, bias=False),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][0]),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(efn_params[encoder]['filters'][0], efn_params[encoder]['filters'][0], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][0]),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(efn_params[encoder]['filters'][0], efn_params[encoder]['filters'][0], 3, 2, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][0]),
+            nn.ReLU(inplace=True),
+        )
 
-        self.up2to1 = conv_bn_relu(c2, c1, dilation=dilation)
-        self.dec1   = conv_bn_relu(c1 + c1, c1, dilation=dilation)
+        self.v_head = nn.Sequential(
+            nn.Conv2d(efn_params[encoder]['filters'][0] * 3, efn_params[encoder]['filters'][0], 3, 1, 1),
+            nn.BatchNorm2d(efn_params[encoder]['filters'][0]),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(efn_params[encoder]['filters'][0], 1, 3, 1, 1)
+        )
 
-        self.head   = nn.Conv2d(c1, out_channels, kernel_size=1)
+    def forgery_forward(self, x):
+        x1 = self.conv_stem(x)
+        d1 = self.down1(x1)
+        d2 = self.down2(d1)
+        d3 = self.down3(d2)
+        d4 = self.down4(d3)
 
-    def forward(self, f1, f2, f3, s):
-        x = F.interpolate(s, size=f3.shape[-2:], mode="bilinear", align_corners=False)
-        x = self.up4to3(x)
-        x = self.dec3(torch.cat([x, f3], dim=1))
+        p1 = self.p_up1(d4)
+        p1 = self.p_merge1(torch.cat((p1, d3), dim=1))
+        p2 = self.p_up2(p1)
+        p2 = self.p_merge2(torch.cat((p2, d2), dim=1))
+        p3 = self.p_up3(p2)
+        p3 = self.p_merge3(torch.cat((p3, d1), dim=1))
+        p4 = self.p_up4(p3)
+        p4 = self.p_merge4(torch.cat((p4, x1), dim=1))
 
-        x = F.interpolate(x, size=f2.shape[-2:], mode="bilinear", align_corners=False)
-        x = self.up3to2(x)
-        x = self.dec2(torch.cat([x, f2], dim=1))
+        v1 = self.v_up1(d4)
+        v1 = self.v_merge1(torch.cat((v1, d3), dim=1))
+        v2 = self.v_up2(v1)
+        v2 = self.v_merge2(torch.cat((v2, d2), dim=1))
+        v3 = self.v_up3(v2)
+        v3 = self.v_merge3(torch.cat((v3, d1), dim=1))
+        v4 = self.v_up4(v3)
+        v4 = self.v_merge4(torch.cat((v4, x1), dim=1))
+        return p4, v4
 
-        x = F.interpolate(x, size=f1.shape[-2:], mode="bilinear", align_corners=False)
-        x = self.up2to1(x)
-        x = self.dec1(torch.cat([x, f1], dim=1))
+    def prob_forward(self, x, p_pre, v_pre, p_post, v_post):
+        p_mask_out = self.p_mask_out(x[:, -1:, :, :])
+        logits    = self.p_head(torch.cat((p_pre, p_post, p_mask_out), dim=1))
+        probs = F.softmax(logits, dim = 1)
 
-        x =  F.interpolate(x, size= 256, mode="bilinear", align_corners=False)
-
-        return self.head(x)   # resolution == input resolution
-
-
-class PolicyHead(nn.Module):
-  
-    def __init__(self, enc_channels, num_actions=2, dilation=2):
-        super().__init__()
-        self.decoder = DilatedDecoderHead(enc_channels, num_actions, dilation)
-
-    def forward(self, f1, f2, f3, s):
-        logits = self.decoder(f1, f2, f3, s)          # (B, |A|, H, W)
-        probs = F.softmax(logits, dim=1)
-        return probs, logits
-
-
-class ValueHead(nn.Module):
-
-    def __init__(self, enc_channels, dilation=2):
-        super().__init__()
-        self.decoder = DilatedDecoderHead(enc_channels, 1, dilation)
-
-    def forward(self, f1, f2, f3, s):
-        return self.decoder(f1, f2, f3, s)             # (B, 1, H, W)
-
-
-# ----------------------------------------------------------------------------------- #
-#  Full PA3C model = SharedTrunk (theta_s) + PolicyHead (theta_p) + ValueHead (theta_v)
-# ----------------------------------------------------------------------------------- #
-
-class PA3C(nn.Module):
-    
-    def __init__(self):
-        super().__init__()
-        self.trunk = SharedTrunk()
-        ch = self.trunk.out_channels
-        self.policy_head = PolicyHead(ch, num_actions = 2, dilation = 2)
-        self.value_head = ValueHead(ch, dilation = 2)
-
-    def forward(self, x):
-        f1, f2, f3, s = self.trunk(x)
-        probs, logits = self.policy_head(f1, f2, f3, s)
-        value = self.value_head(f1, f2, f3, s)
-        return probs, logits, value
-
-    # convenience accessors matching the paper's theta_p / theta_v / theta_s split
-    def theta_s(self):
-        return self.trunk.parameters()
-
-    def theta_p(self):
-        return self.policy_head.parameters()
-
-    def theta_v(self):
-        return self.value_head.parameters()
+        v_mask_out = self.v_mask_out(x[:, -1:, :, :])
+        v_out = self.v_head(torch.cat((v_pre, v_post, v_mask_out), dim=1))
+        return probs, logits, v_out
 
 
 class PixelDRLMG(nn.Module):
     
     def __init__(self):
         super().__init__()
-        self.pa3c = PA3C()
+        self.model = AC_CoDE()
+        self.p_pre = None
+        self.v_pre = None
+        self.p_post = None
+        self.v_post = None
 
-    def forward(self, x):
-        return self.pa3c(x)
-
-    def act(self, x, greedy: bool = False):
-        
-        probs, logits, value = self.pa3c(x)
+    def act(self, statevar, t, greedy: bool = False):
+        if t == 0:
+            self.p_pre,  self.v_pre  = self.model.forgery_forward(statevar[:, :3, :, :])
+            self.p_post, self.v_post = self.model.forgery_forward(statevar[:, 3:-1, :, :])
+        probs, logits, value = self.model.prob_forward(statevar, self.p_pre, self.v_pre, self.p_post, self.v_post)
+            
         dist = torch.distributions.Categorical(probs=probs.permute(0, 2, 3, 1))
         if greedy:
             action = probs.argmax(dim=1)
@@ -229,4 +278,4 @@ class PixelDRLMG(nn.Module):
             action = dist.sample()
         log_prob = dist.log_prob(action)          # (B, H, W)
         entropy = dist.entropy()                  # (B, H, W)
-        return action, log_prob, entropy, value.squeeze(1)
+        return action, log_prob, entropy, value.squeeze(1), value

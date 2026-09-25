@@ -35,53 +35,50 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from config import Config
-from dataset import MedicalSegmentationDataset
+from dataset import LEVIRCDPatchDataset
 from env import PixelEnv, NeighborhoodAggregator, compute_targets
 from metrics import compute_all_metrics, average_metrics
-from model import PixelDRL_MG
+from model import PixelDRLMG
+from torchvision import transforms
 
 
-def rollout_episode(model, env, aggregator, image, gt, t_max, gamma, device):
-    """
-    Runs one t_max-step episode of the dynamic iterative update policy for
-    an entire batch of images, collecting log-probs, entropies, values and
-    rewards needed to compute the PA3C losses (Eqs. 8-16).
+def rollout_episode(model, env, aggregator, pre_change_image, post_change_image, gt, t_max, gamma, device):
 
-    Returns:
-        log_probs: list[T] of (B, H, W)
-        entropies: list[T] of (B, H, W)
-        values:    list[T+1] of (B, H, W)   (values[0..T-1] on-policy, values[T] terminal)
-        rewards:   list[T] of (B, H, W)
-        final_mask: (B, 1, H, W) segmentation output f^(T)
-    """
-    B, _, H, W = image.shape
-    mask = env.init_mask(image)  # m^(0), shape (B, 1, H, W)
+    B, _, H, W = pre_change_image.shape
+    mask = env.init_mask(pre_change_image)
 
     log_probs, entropies, values, rewards = [], [], [], []
 
-    for t in range(t_max):
-        x_t = env.temp_input(image, mask)               # X^(t)
-        action, log_prob, entropy, value = model.act_sample(x_t)
-        # action, log_prob, entropy, value: (B, H, W) / (B, H, W) / (B, H, W) / (B, H, W)
+    # NEW
+    mask_history = [mask.clone()]
 
-        new_mask_2d = env.step(mask.squeeze(1), action)  # m^(t+1), (B, H, W)
-        r = env.reward(mask.squeeze(1), new_mask_2d, gt.squeeze(1))  # r^(t), (B, H, W)
+    for t in range(t_max):
+        x_t = torch.cat([pre_change_image, post_change_image, mask], dim = 1)
+
+        action, log_prob, entropy, value, _ = model.act(x_t, t)
+
+        (action==0).float().mean()
+
+        new_mask_2d = env.step(mask.squeeze(1), action)
+
+        r = env.reward(mask.squeeze(1), new_mask_2d, gt.squeeze(1))
 
         log_probs.append(log_prob)
         entropies.append(entropy)
         values.append(value)
         rewards.append(r)
 
-        mask = new_mask_2d.unsqueeze(1)                  # (B, 1, H, W)
+        mask = new_mask_2d.unsqueeze(1)
 
-    # Terminal value estimate (Algorithm 1, line 17: V(s^(t); theta') for
-    # non-terminal states, used to bootstrap the final step's return).
+        # NEW
+        mask_history.append(mask.clone())
+
     with torch.no_grad():
-        x_T = env.temp_input(image, mask)
-        _, v_T = model(x_T)
+        x_T = torch.cat([pre_change_image, post_change_image, mask], dim = 1)
+        _, _, _, _, v_T = model.act(x_T, t=t_max, greedy=True)
     values.append(v_T)
 
-    return log_probs, entropies, values, rewards, mask
+    return log_probs, entropies, values, rewards, mask, mask_history
 
 
 def compute_losses(log_probs, entropies, values, returns, entropy_coef, value_loss_coef):
@@ -114,30 +111,60 @@ def compute_losses(log_probs, entropies, values, returns, entropy_coef, value_lo
     total_loss = policy_loss + value_loss_coef * value_loss + entropy_coef * entropy_loss
     return total_loss, policy_loss.item(), value_loss.item()
 
+import matplotlib.pyplot as plt
 
-def train(cfg: Config, train_root, val_root=None, k_shot=None):
+def plot_rollout(image, gt, mask_history, epoch):
+
+    n = len(mask_history)
+
+    plt.figure(figsize=(3*n, 6))
+
+    # Input image
+    plt.subplot(2, n+2, 1)
+    plt.imshow(image[0,0].cpu(), cmap='gray')
+    plt.title("Input")
+    plt.axis("off")
+
+    # Ground truth
+    plt.subplot(2, n+2, 2)
+    plt.imshow(gt[0,0].cpu(), cmap='gray')
+    plt.title("GT")
+    plt.axis("off")
+
+    # Masks
+    for i, mask in enumerate(mask_history):
+
+        plt.subplot(2, n+2, i+3)
+        plt.imshow(mask[0,0].detach().cpu(), cmap='gray', vmin=0, vmax=1)
+        plt.title(f"t={i}")
+        plt.axis("off")
+
+    os.makedirs("rollouts", exist_ok=True)
+
+    plt.suptitle(f"Epoch {epoch}")
+    plt.tight_layout()
+    plt.savefig(f"rollouts/epoch_{epoch}.png")
+    plt.close()
+
+def train(cfg: Config,  k_shot=None):
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     torch.manual_seed(cfg.seed)
 
     os.makedirs(cfg.ckpt_dir, exist_ok=True)
     os.makedirs(cfg.results_dir, exist_ok=True)
+    transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.ToTensor()
+    ])
+    
+    root_dir = "../../levir-cd-256"
 
-    train_ds = MedicalSegmentationDataset(train_root, split="train",
-                                           image_size=cfg.image_size,
-                                           seed=cfg.seed, k_shot=k_shot)
+    train_ds = LEVIRCDPatchDataset(root_dir,mask_transform = transform)
+    
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
                                num_workers=2, drop_last=True)
 
-    val_loader = None
-    if val_root is not None:
-        val_ds = MedicalSegmentationDataset(val_root, split="val",
-                                             image_size=cfg.image_size, seed=cfg.seed)
-        val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=2)
-
-    model = PixelDRL_MG(in_channels=cfg.in_channels, n_actions=cfg.n_actions,
-                         use_sam=cfg.use_sam, use_dc=cfg.use_dc,
-                         policy_hidden=cfg.policy_hidden, value_hidden=cfg.value_hidden,
-                         n_layers=cfg.n_layers).to(device)
+    model = PixelDRLMG().to(device)
 
     aggregator = NeighborhoodAggregator().to(device)
     env = PixelEnv(device)
@@ -153,13 +180,13 @@ def train(cfg: Config, train_root, val_root=None, k_shot=None):
         epoch_start = time.time()
         running_loss, running_dice = 0.0, 0.0
 
-        for batch_idx, (image, gt) in enumerate(train_loader):
-            image, gt = image.to(device), gt.to(device)
+        for batch_idx, (pre_change_image, post_change_image, gt) in enumerate(train_loader):
+            pre_change_image, post_change_image, gt = pre_change_image.to(device), post_change_image.to(device), gt.to(device)
 
             optimizer.zero_grad()
-
-            log_probs, entropies, values, rewards, final_mask = rollout_episode(
-                model, env, aggregator, image, gt, cfg.t_max, cfg.gamma, device
+            
+            log_probs, entropies, values, rewards, final_mask, mask_history = rollout_episode(
+                model, env, aggregator, pre_change_image, post_change_image, gt, cfg.t_max, cfg.gamma, device
             )
 
             returns = compute_targets(rewards, values, cfg.gamma, aggregator)
@@ -189,13 +216,13 @@ def train(cfg: Config, train_root, val_root=None, k_shot=None):
                       f"loss={total_loss.item():.4f} (p={p_loss:.4f}, v={v_loss:.4f}) "
                       f"dice={dice:.4f}")
 
+            if batch_idx == 0:
+                plot_rollout(pre_change_image, gt, mask_history, epoch)
+
         scheduler.step()
         n_batches = len(train_loader)
         print(f"== Epoch {epoch:03d} done in {time.time()-epoch_start:.1f}s | "
               f"avg_loss={running_loss/n_batches:.4f} avg_dice={running_dice/n_batches:.4f} ==")
-
-        if val_loader is not None and (epoch + 1) % 10 == 0:
-            evaluate(model, env, val_loader, cfg, device, tag=f"val_epoch{epoch}")
 
         if (epoch + 1) % 25 == 0:
             ckpt_path = os.path.join(cfg.ckpt_dir, f"pixeldrl_mg_epoch{epoch+1}.pt")
@@ -207,43 +234,11 @@ def train(cfg: Config, train_root, val_root=None, k_shot=None):
     return model, aggregator
 
 
-@torch.no_grad()
-def evaluate(model, env, data_loader, cfg: Config, device, tag="test"):
-    """
-    Runs the greedy (non-stochastic) dynamic iterative update policy for
-    t_max steps and reports DICE/PPV/SEN/IoU/BIoU/HD95, matching Table 2's
-    evaluation protocol.
-    """
-    model.eval()
-    all_metrics = []
-    for image, gt in data_loader:
-        image, gt = image.to(device), gt.to(device)
-        mask = env.init_mask(image)
-        for t in range(cfg.t_max):
-            x_t = env.temp_input(image, mask)
-            action, _, _ = model.act_greedy(x_t)
-            new_mask_2d = env.step(mask.squeeze(1), action)
-            mask = new_mask_2d.unsqueeze(1)
-
-        pred = (mask > 0.5).float()
-        for b in range(pred.shape[0]):
-            all_metrics.append(compute_all_metrics(pred[b, 0], gt[b, 0]))
-
-    avg = average_metrics(all_metrics)
-    print(f"[{tag}] " + " ".join(f"{k}={v:.4f}" for k, v in avg.items()))
-    model.train()
-    return avg
-
-
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train_root", type=str, required=True,
-                         help="Path to dataset root containing images/ and masks/ subfolders")
-    parser.add_argument("--val_root", type=str, default=None)
-    parser.add_argument("--k_shot", type=int, default=None,
-                         help="For the extreme-data-constraint experiments (Table 4): 50 or 100")
+    
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--no_sam", action="store_true")
     parser.add_argument("--no_dc", action="store_true")
@@ -257,4 +252,4 @@ if __name__ == "__main__":
     if args.no_dc:
         cfg.use_dc = False
 
-    train(cfg, args.train_root, args.val_root, k_shot=args.k_shot)
+    train(cfg,  k_shot= None)
